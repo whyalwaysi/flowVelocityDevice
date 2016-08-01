@@ -44,14 +44,14 @@ extern  volatile unsigned long tint1;
 #define FLASH_PAR_HEAD2 0x55
 #define FLASH_PAR_HEAD3 0x69
 #define FLASH_PAR_HEAD4 0x96
-#define FLASH_PAR_FRAME_LENGTH 23
+#define FLASH_PAR_FRAME_LENGTH 27
 #define DATA_FRAME_SEND_PORT_INDEX 0
 #define WXYZ_READ_PORT_INDEX 1
 
 //send frame defination
-#define SEND_FRAME_LENGTH 13
-#define SEND_FRAME_TYPE_DATA 1	//data frame
-#define SEND_FRAME_TYPE_MSG 2	//message frame
+#define SEND_FRAME_LENGTH 28
+//#define SEND_FRAME_TYPE_DATA 1	//data frame
+//#define SEND_FRAME_TYPE_MSG 2	//message frame
 
 //message code defination
 #define MSGCODE_SYSTEM_INIT_FAIL 1
@@ -78,15 +78,73 @@ int g_frame_send_port = DATA_FRAME_SEND_PORT_INDEX;
 //system init flag, 0=undone, else=done
 unsigned int g_system_init_flag = 0;
 volatile int g_timer_flag = 0;
+//device number
+char g_device_num[2] = {'0', '0'};
+//system key
+char g_system_key[2] = {'0', '0'};
 float g_device_install_angelw[3] = {0.0, 0.0, 0.0};
 float g_flow_velocity[2] = {0.0, 0.0};
-//send frame format:
-//0xaa, 0x55, msg_type_byte, msg_data_byte,
-//lowf_low_byte1, byte2, byte3, byte4, highf_low_byte1, byte2, byte3, byte4, parity
-int g_send_buf[16] = {0xaa, 0x55}; 
+
+int g_send_buf[32] = {'I',//header
+'0', '0',//device number
+'0', '0',//system key
+'0', '0', '0', '0',//low frequence data, mm/s
+'0', '0', '0', '0',//high frequence data, mm/s
+'0', '0', '0', '0',//place holder, first 2 decimal use as msg_type_byte, last 2 decimal use as msg_data_byte
+'0', '1', '9', '9',//quality string, set as 0199
+'0', '0', '0', '0',//checksum
+';', '\r', '\n'}; //end
 volatile unsigned int *sfifo_port_regs[2][3] = {
 {(volatile unsigned int *)SFIFO_DATA1, (volatile unsigned int *)SFIFO_BAUND1, (volatile unsigned int *)SFIFO_CTL1}, 
 {(volatile unsigned int *)SFIFO_DATA2, (volatile unsigned int *)SFIFO_BAUND2, (volatile unsigned int *)SFIFO_CTL2}};
+
+int myStrlen(const char *cbuf){
+	int retval = 0;
+	
+	while((*cbuf) != 0){
+		++retval;
+	}
+	
+	return retval;
+}
+
+int i2a(unsigned int value, char *cbuf, int radix){
+	char tmpbuf[16];
+	int retval = 0;
+	unsigned int tmpui, rest;
+	
+	while(value > 0){
+		tmpui = value / radix;
+		rest = value - tmpui * radix;
+		if(rest < 10){	//get value mod radix
+			tmpbuf[retval++] = '0' + rest;
+		}else tmpbuf[retval++] = 'A' + rest - 10;
+		value = tmpui;	//value = value / 10
+	}
+	//copy reversely
+	for(tmpui = 0; tmpui < retval; ++tmpui){
+		cbuf[tmpui] = tmpbuf[retval-tmpui-1];
+	}
+	cbuf[retval] = 0;
+	
+	return retval;
+}
+
+void i2str(int value, int *strbuf, int radix, int buflen){
+	char tmpbuf[16] = {0};
+	int tmpi, i;
+	
+	i2a(value, tmpbuf, radix);
+	tmpi = myStrlen(tmpbuf);
+	if(tmpi < buflen){//fill '0'
+		for(i = 0; i < buflen-tmpi; ++i){
+			strbuf[i] = '0';
+		}
+	}else i = 0;
+	for(tmpi = 0; i < buflen; ++i, ++tmpi){
+		strbuf[i] = (int)tmpbuf[tmpi];
+	}
+}
 
 int sfifo_init(const unsigned int *cbuf, int port_ix){
 	volatile unsigned int *ctl_regp;
@@ -146,7 +204,9 @@ int sfifo_init(const unsigned int *cbuf, int port_ix){
 //	16: serial send port2 parity bit(1 byte, 0=no parity(default), 1=odd, 2=even)
 //	17: serial send port2 stop bit(1 byte, default 1 bit)
 //	18: serial send port2 baund rate(4 bytes)
-//	22: sum parity(1 byte)
+//	22: device number(2 bytes)
+//	24: system key(2 bytes)
+//	26: sum parity(1 byte)
 int par_conf(){
 	unsigned int dbuf[40];
 	unsigned int tmpui;
@@ -197,6 +257,13 @@ int par_conf(){
 	retval |= sfifo_init(&dbuf[10], 0);
 	retval |= sfifo_init(&dbuf[16], 1);
 	
+	//set device number
+	g_device_num[0] = dbuf[22];
+	g_device_num[1] = dbuf[23];
+	//set system key
+	g_system_key[0] = dbuf[24];
+	g_system_key[1] = dbuf[25];
+	
 	return retval;
 }
 
@@ -246,16 +313,23 @@ int sfifo_write(const int port_ix, const int *dbuf, const int dlen){
 }
 
 void system_init_fail_proc(int msgdat){
-	int retval;
+	int retval, checksum;
 	
 	g_msg_code = MSGCODE_SYSTEM_INIT_FAIL;
-	g_send_buf[2] = MSGCODE_SYSTEM_INIT_FAIL;	//message type
+	i2str(MSGCODE_SYSTEM_INIT_FAIL, &g_send_buf[13], 16, 2);
+	//g_send_buf[2] = MSGCODE_SYSTEM_INIT_FAIL;	//message type
 	g_msg_data = msgdat;
-	g_send_buf[3] = msgdat;	//message data
-	for(retval = 4; retval < SEND_FRAME_LENGTH-1; ++retval){
-		g_send_buf[retval] = 0;
+	i2str(msgdat, &g_send_buf[15], 16, 2);
+	//g_send_buf[3] = msgdat;	//message data
+	//set data to "0000"
+	g_send_buf[5] = '0';
+	g_send_buf[6] = '0';
+	g_send_buf[7] = '0';
+	g_send_buf[8] = '0';
+	for(retval = 0, checksum = 0; retval < SEND_FRAME_LENGTH-7; ++retval){
+		checksum += g_send_buf[retval];
 	}
-	g_send_buf[retval] = (g_send_buf[0]+g_send_buf[1]+g_send_buf[2]+g_send_buf[3]) & 0xff;	//check sum
+	i2str(checksum, &g_send_buf[SEND_FRAME_LENGTH-7], 16, 4);
 }
 
 void system_init(){
@@ -309,9 +383,11 @@ void main()
 	ST = 0x0;	//disable GIE
 	system_init();
 	ST |= 0x2000;	//enable GIE
+	/*
 	if((g_msg_code & MSGCODE_SYSTEM_INIT_FAIL) == 0){//init parameter ok
 		init_install_angel();
 	}
+	*/
 	g_system_init_flag = 1u;
 	
 	for(;;);
@@ -360,7 +436,7 @@ int angel_data_read(){
 				case 0x52:
 				case 0x53:
 				if(check_sum(&cbuf[i], SINGLE_ANGEL_FRAME_LENGTH) == 0){//check OK
-					if(cbuf[i+1] == 0x53){//Wxyz frame
+					if(cbuf[i+1] == 0x52){//Wxyz frame
 						angel_parse(&cbuf[i+2]);	//parse angel data into g_device_install_angelw buffer
 						++retval;
 					}
@@ -432,20 +508,25 @@ void data_assemble(){
 	int i, sum, tmpi;
 	
 	g_msg_code |= MSGCODE_DATA_OUTPUT;
-	g_send_buf[3] = g_msg_data;
+	i2str(g_msg_code, &g_send_buf[13], 16, 2);
+	//g_send_buf[3] = g_msg_data;
+	i2str(g_msg_data, &g_send_buf[15], 16, 2);
 	tmpi = g_flow_velocity[0] * 1000;	// mm/s
-	disassemble_int(&g_send_buf[4], tmpi);
+	//low frequence data
+	i2str(tmpi, &g_send_buf[5], 10, 4);
+	//disassemble_int(&g_send_buf[4], tmpi);
 	tmpi = g_flow_velocity[1] * 1000;	// mm/s
-	disassemble_int(&g_send_buf[8], tmpi);
+	i2str(tmpi, &g_send_buf[9], 10, 4);
+	//disassemble_int(&g_send_buf[8], tmpi);
 	//clear data
 	g_lowf_data = 0;
 	g_highf_data = 0;
 	
 	//sum parity
-	for(i = 0, sum = 0; i < SEND_FRAME_LENGTH-1; ++i){
+	for(i = 0, sum = 0; i < SEND_FRAME_LENGTH-7; ++i){
 		sum += g_send_buf[i];
 	}
-	g_send_buf[i] = sum & 0xff;
+	i2str(tmpi, &g_send_buf[SEND_FRAME_LENGTH-7], 16, 4);
 }
 
 interrupt void c_int03(){
